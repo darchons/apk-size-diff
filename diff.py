@@ -19,8 +19,16 @@ class Diff(object):
 class Differ(object):
     def __init__(self):
         def _zip_handler(name, a, b):
-            with ZipFile(a) as azip:
-                with ZipFile(b) as bzip:
+            if not a or not b:
+                with ZipFile(BytesIO((a or b).read())) as zipf:
+                    for diff in self._diff_zip(zipf if a else None,
+                                               zipf if b else None,
+                                               name + '/'):
+                        yield diff
+                return
+
+            with ZipFile(BytesIO(a.read())) as azip:
+                with ZipFile(BytesIO(b.read())) as bzip:
                     for diff in self._diff_zip(azip, bzip, name + '/'):
                         yield diff
 
@@ -38,8 +46,10 @@ class Differ(object):
         return self._handlers.get(ext)
 
     def diff_zip(self, a, b):
-        for diff in self._diff_zip(a, b, ''):
-            yield diff
+        with ZipFile(a) as azip:
+            with ZipFile(b) as bzip:
+                for diff in self._diff_zip(azip, bzip, ''):
+                    yield diff
 
     def _diff_zip(self, a, b, prefix):
 
@@ -49,39 +59,36 @@ class Differ(object):
 
             if handler:
                 for diff in handler(prefix + name,
-                                    BytesIO(a.read(name)),
-                                    BytesIO(b.read(name))):
+                                    a.open(name) if asize else None,
+                                    b.open(name) if bsize else None):
                     yield diff
                 return
 
             if asize != bsize:
                 yield Diff(prefix + name, asize, bsize)
 
-        afiles = {info.filename: info for info in a.infolist()}
+        afiles = {info.filename: info for info in a.infolist()} if a else {}
 
-        for bfile in b.infolist():
-            name = bfile.filename
-            afile = afiles.pop(name, None)
+        if b:
+            for bfile in b.infolist():
+                name = bfile.filename
+                afile = afiles.pop(name, None)
 
-            if afile:
-                # file updated.
-                for diff in _diff_file(name, afile.file_size, bfile.file_size):
+                # File added or updated.
+                for diff in _diff_file(name,
+                                       afile.file_size if afile else 0,
+                                       bfile.file_size):
                     yield diff
-                continue
-
-            # file added.
-            yield Diff(prefix + name, 0, bfile.file_size)
 
         for afile in afiles.values():
             # file deleted.
-            yield Diff(prefix + afile.filename, afile.file_size, 0)
+            for diff in _diff_file(afile.filename, afile.file_size, 0):
+                yield diff
 
 if __name__ == '__main__':
     import sys
 
-    with ZipFile(sys.argv[1]) as azip:
-        with ZipFile(sys.argv[2]) as bzip:
-            differ = Differ()
-            for diff in differ.diff_zip(azip, bzip):
-                print(diff)
+    differ = Differ()
+    for diff in differ.diff_zip(sys.argv[1], sys.argv[2]):
+        print(diff)
 
