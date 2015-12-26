@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
+from ctypes import *
+from ctypes.util import find_library
+
 import io
 import struct
-import zlib
 
 def _bcj_filter_thumb(buf, offset, chunkSize, unfilter):
     end = offset
@@ -62,6 +64,40 @@ def _bcj_filter_arm(buf, offset, chunkSize, unfilter):
 
     return buf
 
+libz = CDLL(find_library('z'))
+
+class ZStream(Structure):
+    _fields_ = [
+        ('next_in', POINTER(c_byte)),
+        ('avail_in', c_uint),
+        ('total_in', c_ulong),
+
+        ('next_out', POINTER(c_byte)),
+        ('avail_out', c_uint),
+        ('total_out', c_ulong),
+
+        ('msg', c_char_p),
+        ('state', c_void_p),
+
+        ('zalloc', c_void_p),
+        ('zfree', c_void_p),
+        ('opaque', c_void_p),
+
+        ('data_type', c_int),
+        ('adler', c_ulong),
+        ('reserved', c_ulong),
+    ]
+
+libz.inflateInit2_.argtypes = [POINTER(ZStream), c_int, c_char_p, c_int]
+libz.inflateSetDictionary.argtypes = [POINTER(ZStream), POINTER(c_byte), c_uint]
+libz.inflate.argtypes = [POINTER(ZStream), c_int]
+libz.inflateReset.argtypes = [POINTER(ZStream)]
+libz.inflateEnd.argtypes = [POINTER(ZStream)]
+
+Z_OK = 0
+Z_STREAM_END = 1
+Z_FINISH = 4
+
 class SZipFile(object):
     def __init__(self, f):
 
@@ -82,32 +118,17 @@ class SZipFile(object):
         assert magic == 0x7a5a6553
 
         fmt = '<LLHHLHbB'
-        (magic, totalSize, chunkSize, dictSize,
-                nChunks, lastChunkSize, windowBits, filt
+        (magic, totalSize, self._chunkSize, dictSize,
+                self._nChunks, self._lastChunkSize, self._windowBits, self._filt
                 ) = struct.unpack(fmt, f.read(struct.calcsize(fmt)))
 
-        self._header = None
+        self._dictionary = (c_byte * dictSize).from_buffer_copy(
+                f.read(dictSize)) if dictSize else None
 
-        if dictSize:
-            dictionary = f.read(dictSize)
-            if windowBits < 0:
-                # Work around Python zlib bug of not properly setting dictionary
-                # for raw inflate, by manually adding a header and tail to create a
-                # full zlib stream
-                self._header = struct.pack('>BBL', 0x78, 0xBB, zlib.adler32(dictionary))
-                windowBits = -windowBits
-            self._inflator = zlib.decompressobj(wbits=windowBits, zdict=dictionary)
-        else:
-            self._inflator = zlib.decompressobj(wbits=windowBits)
-
-        fmt = '<' + str(nChunks) + 'L'
+        fmt = '<' + str(self._nChunks) + 'L'
         self._offsets = struct.unpack(fmt, f.read(struct.calcsize(fmt)))
 
-        self._outSize = (nChunks - 1) * chunkSize + lastChunkSize
-        self._chunkSize = chunkSize
-        self._nChunks = nChunks
-        self._lastChunkSize = lastChunkSize
-        self._filt = filt
+        self._outSize = (self._nChunks - 1) * self._chunkSize + self._lastChunkSize
         self._buffer = bytearray()
         self._index = 0
 
@@ -133,24 +154,43 @@ class SZipFile(object):
 
         self._buffer.extend(bytearray(newSize - oldSize))
 
-        for i in range(oldChunk, newChunk):
-            inflator = self._inflator.copy()
+        zstream = ZStream()
+        zstream.zalloc = None
+        zstream.zfree = None
+        zstream.opaque = None
 
+        for i in range(oldChunk, newChunk):
             if i < self._nChunks - 1:
                 data = self._file.read(self._offsets[i + 1] - self._offsets[i])
             else:
                 data = self._file.read()
 
-            if self._header:
-                data = self._header + data
-                out = inflator.decompress(data)
-                out = out + inflator.decompress(
-                        struct.pack('>L', zlib.adler32(out))) + inflator.flush()
-            else:
-                out = inflator.decompress(data) + inflator.flush()
+            zstream.next_in = (c_byte * len(data)).from_buffer_copy(data)
+            zstream.avail_in = len(data)
 
             start = i * chunkSize
-            self._buffer[start: start + len(out)] = out
+            zstream.next_out = (c_byte * min(chunkSize, newSize - start)
+                    ).from_buffer(self._buffer, start)
+            zstream.avail_out = chunkSize
+
+            if i != oldChunk:
+                if libz.inflateReset(byref(zstream)) != Z_OK:
+                    raise Exception('zlib: ' + zstream.msg.decode('utf-8'))
+            else:
+                if libz.inflateInit2_(byref(zstream), self._windowBits,
+                                      b"1.2.8", sizeof(zstream)) != Z_OK:
+                    raise Exception('zlib: initialization failed')
+
+            if self._dictionary:
+                if libz.inflateSetDictionary(byref(zstream), self._dictionary,
+                                             len(self._dictionary)) != Z_OK:
+                    raise Exception('zlib: ' + zstream.msg.decode('utf-8'))
+
+            if libz.inflate(byref(zstream), Z_FINISH) != Z_STREAM_END:
+                raise Exception('zlib: ' + zstream.msg.decode('utf-8'))
+
+        if libz.inflateEnd(byref(zstream)) != Z_OK:
+            raise Exception('zlib: ' + zstream.msg.decode('utf-8'))
 
         if self._filt == 1:
             _bcj_filter_thumb(self._buffer, oldSize, chunkSize, unfilter=True)
